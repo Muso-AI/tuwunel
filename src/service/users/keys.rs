@@ -2,10 +2,11 @@ use std::{collections::BTreeMap, mem};
 
 use futures::{Stream, StreamExt, TryFutureExt, pin_mut};
 use ruma::{
-	DeviceId, KeyId, OneTimeKeyAlgorithm, OneTimeKeyId, OneTimeKeyName, OwnedKeyId,
-	OwnedOneTimeKeyId, OwnedRoomId, OwnedServerName, RoomId, UInt, UserId,
+	CanonicalJsonObject, DeviceId, KeyId, OneTimeKeyAlgorithm, OneTimeKeyId, OneTimeKeyName,
+	OwnedKeyId, OwnedOneTimeKeyId, OwnedRoomId, OwnedServerName, RoomId, UInt, UserId,
 	encryption::{CrossSigningKey, DeviceKeys, OneTimeKey},
-	serde::Raw,
+	serde::{Base64, Raw},
+	signatures::{PublicKeyMap, PublicKeySet},
 };
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
@@ -448,6 +449,14 @@ pub async fn sign_key(
 		.deserialized()
 		.map_err(|e| err!(Database(debug_warn!("key in keyid_key is invalid: {e:?}"))))?;
 
+	// Cryptographically verify the uploaded signature before storing it. Without
+	// this the homeserver accepts — and later serves via /keys/query — arbitrary
+	// or forged cross-signing signatures, including cross-user signatures made
+	// with a key the signer never published. Reject anything that does not verify
+	// against a signing key `sender_id` actually published.
+	self.verify_uploaded_signature(sender_id, &cross_signing_key, &signature)
+		.await?;
+
 	let signatures = cross_signing_key
 		.get_mut("signatures")
 		.ok_or_else(|| err!(Database(debug_warn!("key in keyid_key has no signatures field"))))?
@@ -473,6 +482,95 @@ pub async fn sign_key(
 	self.mark_device_key_update(target_id).await;
 
 	Ok(())
+}
+
+/// Verify a single uploaded cross-signing signature against a key the signer has
+/// actually published. Returns an error (→ `M_INVALID_SIGNATURE` failure) when
+/// the signer key is unknown or the signature does not cryptographically verify.
+#[implement(super::Service)]
+async fn verify_uploaded_signature(
+	&self,
+	sender_id: &UserId,
+	target_key: &serde_json::Value,
+	signature: &(String, String),
+) -> Result {
+	let (sig_key_id, sig) = signature;
+
+	// Resolve the referenced signing key, but ONLY among keys `sender_id` has
+	// published. A key we can't resolve to published material is rejected — an id
+	// that embeds its own public key must not be sufficient to "verify".
+	let signer_keys = self.signer_public_keys(sender_id, sig_key_id).await;
+	if !signer_keys.contains_key(sig_key_id.as_str()) {
+		return Err!(Request(InvalidParam(debug_warn!(
+			"Signature key {sig_key_id} is not a published signing key of {sender_id}"
+		))));
+	}
+
+	// Present only the candidate signature; verify_json checks every signature in
+	// the object and requires each one's key to be resolvable.
+	let mut candidate = target_key.clone();
+	if let Some(obj) = candidate.as_object_mut() {
+		let mut per_key = serde_json::Map::new();
+		per_key.insert(sig_key_id.clone(), serde_json::Value::String(sig.clone()));
+		let mut per_user = serde_json::Map::new();
+		per_user.insert(sender_id.to_string(), serde_json::Value::Object(per_key));
+		obj.insert("signatures".to_owned(), serde_json::Value::Object(per_user));
+		obj.remove("unsigned");
+	}
+
+	let canonical: CanonicalJsonObject = serde_json::from_value(candidate).map_err(|e| {
+		err!(Request(InvalidParam(debug_warn!("signed key is not canonical JSON: {e}"))))
+	})?;
+
+	let keys: PublicKeyMap = [(sender_id.to_string(), signer_keys)].into();
+
+	ruma::signatures::verify_json(&keys, &canonical).map_err(|e| {
+		err!(Request(InvalidParam(debug_warn!(
+			"cross-signing signature from {sender_id} failed verification: {e}"
+		))))
+	})
+}
+
+/// Collect the ed25519 public keys `sender_id` has published (master,
+/// self-signing, user-signing, and — when the signature references a device —
+/// that device's key), as a `PublicKeySet` keyed by full key id.
+#[implement(super::Service)]
+async fn signer_public_keys(&self, sender_id: &UserId, sig_key_id: &str) -> PublicKeySet {
+	let mut set = PublicKeySet::new();
+	let allow_all = |_: &UserId| true;
+
+	let cross_signing = [
+		self.get_master_key(None, sender_id, &allow_all).await.ok(),
+		self.get_self_signing_key(None, sender_id, &allow_all)
+			.await
+			.ok(),
+		self.get_user_signing_key(sender_id).await.ok(),
+	];
+	for raw in cross_signing.into_iter().flatten() {
+		if let Ok(csk) = raw.deserialize() {
+			for (id, pubkey) in csk.keys {
+				if let Ok(pubkey) = Base64::parse(pubkey) {
+					set.insert(id.to_string(), pubkey);
+				}
+			}
+		}
+	}
+
+	// A device signature (e.g. a device signing its owner's master key) names the
+	// device by id; pull that device's published ed25519 key too.
+	if let Some(device_id) = sig_key_id.strip_prefix("ed25519:") {
+		if let Ok(raw) = self.get_device_keys(sender_id, device_id.into()).await {
+			if let Ok(dk) = raw.deserialize() {
+				for (id, pubkey) in dk.keys {
+					if let Ok(pubkey) = Base64::parse(pubkey) {
+						set.insert(id.to_string(), pubkey);
+					}
+				}
+			}
+		}
+	}
+
+	set
 }
 
 #[implement(super::Service)]

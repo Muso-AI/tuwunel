@@ -1,14 +1,20 @@
+use std::collections::BTreeMap;
+
 use axum::extract::State;
 use futures::StreamExt;
-use ruma::{UserId, api::client::keys::upload_signatures};
+use ruma::{OwnedUserId, UserId, api::client::keys::upload_signatures};
 use serde_json::value::RawValue;
 use tuwunel_core::{Result, debug, debug_warn, utils::IterStream};
 
 use crate::Ruma;
 
+type Failures = BTreeMap<OwnedUserId, BTreeMap<String, upload_signatures::v3::Failure>>;
+
 /// # `POST /_matrix/client/r0/keys/signatures/upload`
 ///
-/// Uploads end-to-end key signatures from the sender user.
+/// Uploads end-to-end key signatures from the sender user. Signatures that do
+/// not cryptographically verify are rejected and reported per-key in `failures`
+/// (`M_INVALID_SIGNATURE`), rather than being stored and served back verbatim.
 pub(crate) async fn upload_signatures_route(
 	State(services): State<crate::State>,
 	body: Ruma<upload_signatures::v3::Request>,
@@ -20,26 +26,37 @@ pub(crate) async fn upload_signatures_route(
 		return Ok(upload_signatures::v3::Response::new());
 	}
 
-	body.signed_keys
+	let failures = body
+		.signed_keys
 		.iter()
 		.flat_map(|(user_id, keys)| {
 			keys.iter().flat_map(move |(key_id, key)| {
 				signatures_from_key(sender_user, key_id, key)
-					.map(move |sig| (user_id.as_ref(), key_id, sig))
+					.map(move |sig| (user_id.clone(), key_id.to_string(), sig))
 			})
 		})
 		.stream()
-		.for_each_concurrent(None, async |(user_id, key_id, signature)| {
+		.filter_map(async |(user_id, key_id, signature)| {
 			services
 				.users
-				.sign_key(user_id, key_id, signature, sender_user)
+				.sign_key(&user_id, &key_id, signature, sender_user)
 				.await
-				.inspect_err(|e| debug_warn!("{e}"))
-				.ok();
+				.err()
+				.map(|e| (user_id, key_id, e.to_string()))
+		})
+		.fold(Failures::new(), async |mut acc, (user_id, key_id, error)| {
+			let failure: upload_signatures::v3::Failure = serde_json::from_value(
+				serde_json::json!({ "errcode": "M_INVALID_SIGNATURE", "error": error }),
+			)
+			.expect("well-formed signature failure");
+			acc.entry(user_id).or_default().insert(key_id, failure);
+			acc
 		})
 		.await;
 
-	Ok(upload_signatures::v3::Response::default())
+	let mut response = upload_signatures::v3::Response::new();
+	response.failures = failures;
+	Ok(response)
 }
 
 fn signatures_from_key(
