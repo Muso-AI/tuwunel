@@ -1,0 +1,100 @@
+name: qa-autoreview-trigger
+
+# Triggers hydra's QA auto-review bot for this repo's PRs.
+#
+# This repo has no openclaw gateway; the bot lives in Muso-AI/hydra on its
+# self-hosted runner. So on each non-draft PR whose base is develop/main/master
+# we fire a repository_dispatch into hydra (event_type "external-qa-review")
+# carrying the PR coordinates. hydra's .github/workflows/external-pr-review.yml
+# allowlists the repo, re-resolves the PR's real author from the API (the payload
+# author is authenticated but NOT authoritative), maps that author to a Slack UID,
+# and runs the review + DM.
+#
+# The branch list is the exact trio hydra itself gates on (external-pr-review.yml
+# refuses any other base), so it is deliberately wider than this repo's branches
+# today: a stable branch added later is auto-covered with no change here, and a
+# base that never exists never fires. Mirrors the onboarded-repo pattern already
+# in analytics-controller / platform-ticker / feed-service.
+#
+# ADVISORY, NOT A GATE. The verdict comes back as a `qa-review` commit status
+# (green on GO, red on NO-GO), a COMMENT-event PR review, and a Slack DM to the
+# author. `qa-review` is not a required status check here and must not become
+# one: a red verdict shows as "some checks were not successful" while the merge
+# button stays live. The author decides what to do about it. hydra pins the
+# merge-gate half in policies/qa-approval-policy.json — .merge_gate_repos is
+# empty, so no repo is held by the bot; the repo-side half is branch protection,
+# which nothing in this file can enforce.
+#
+# This job is the only check it adds, and it is green whenever the dispatch is
+# accepted — it reports whether hydra was told, never what hydra thought. A
+# review still runs when this is the repo's only workflow; the auto-APPROVAL half
+# additionally needs a non-empty check rollup to approve against (hydra's
+# qa-pr-approve.sh Guard 6), so a repo with no other CI stays review-only.
+#
+# Auth: secrets.DEVOPS_DISPATCH_PAT, an ORG-level secret with visibility "all",
+# so it is already readable here with nothing to configure — it carries write
+# access to Muso-AI/hydra, which is what POST /dispatches needs. Fork PRs receive
+# no secrets, so they skip cleanly; on a same-repo PR a missing PAT fails the
+# check loudly — a green `dispatch` with no review behind it would be a silent
+# fail-open for this automation.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [develop, main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    # Same-repo branch PRs only: fork PRs receive no secret, and the guard below
+    # turns that into a clean skip rather than a failure. A same-repo PR with a
+    # missing secret fails loud instead.
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Dispatch QA auto-review to hydra
+        env:
+          HYDRA_PAT: ${{ secrets.DEVOPS_DISPATCH_PAT }}
+          SRC_REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HYDRA_PAT:-}" ]; then
+            if [ "$HEAD_REPO" = "$SRC_REPO" ]; then
+              echo "DEVOPS_DISPATCH_PAT not set on a same-repo PR — QA auto-review cannot fire. Failing loud." >&2
+              exit 1
+            fi
+            echo "Fork PR: no secrets available — skipping QA auto-review dispatch."
+            exit 0
+          fi
+          # Build the payload with jq (env-sourced) to avoid any script injection
+          # from the interpolated context values.
+          payload="$(jq -nc \
+            --arg repo "$SRC_REPO" \
+            --argjson pr "$PR_NUMBER" \
+            --arg sha "$HEAD_SHA" \
+            --arg author "$AUTHOR" \
+            --arg base "$BASE" \
+            --argjson draft "$IS_DRAFT" \
+            '{event_type:"external-qa-review",client_payload:{repo:$repo,pr_number:$pr,head_sha:$sha,author:$author,base:$base,is_draft:$draft}}')"
+          echo "Dispatching QA auto-review of ${SRC_REPO}#${PR_NUMBER} (base=${BASE}, author=${AUTHOR}) to hydra"
+          code="$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${HYDRA_PAT}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/Muso-AI/hydra/dispatches \
+            -d "$payload")"
+          # GitHub returns 204 No Content on a successful dispatch.
+          if [ "$code" != "204" ]; then
+            echo "repository_dispatch to hydra failed (HTTP $code):" >&2
+            cat /tmp/dispatch.out >&2 || true
+            exit 1
+          fi
+          echo "Dispatched (HTTP 204)."
